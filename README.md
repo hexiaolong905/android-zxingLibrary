@@ -22,6 +22,7 @@
 - compile 2.1 2016/11/22 修复扫描中的一些bug
 
 - compile 2.2 2017/07/04 更新zxing包，修复一些已知的bug
+- compile 2.3 2021/4/19  更新zxing包，使用Camera2 API，替换已过时的Camera API
 
 **使用说明**
 
