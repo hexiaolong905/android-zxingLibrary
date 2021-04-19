@@ -16,16 +16,34 @@
 
 package com.uuzuche.lib_zxing.camera;
 
+import android.annotation.SuppressLint;
 import android.content.Context;
+import android.graphics.ImageFormat;
 import android.graphics.PixelFormat;
 import android.graphics.Point;
 import android.graphics.Rect;
-import android.hardware.Camera;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CaptureRequest;
+import android.media.Image;
+import android.media.ImageReader;
 import android.os.Build;
 import android.os.Handler;
-import android.view.SurfaceHolder;
+import android.os.HandlerThread;
+import android.os.Message;
+import android.util.Log;
 
-import java.io.IOException;
+
+import androidx.annotation.NonNull;
+
+import com.uuzuche.lib_zxing.view.AutoFitSurfaceView;
+
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 /**
  * This object wraps the Camera service object and expects to be the only one talking to it. The
@@ -47,7 +65,7 @@ public final class CameraManager {
     static {
         int sdkInt;
         try {
-            sdkInt = Integer.parseInt(Build.VERSION.SDK);
+            sdkInt = Build.VERSION.SDK_INT;
         } catch (NumberFormatException nfe) {
             // Just to be safe
             sdkInt = 10000;
@@ -57,21 +75,27 @@ public final class CameraManager {
 
     private final Context context;
     private final CameraConfigurationManager configManager;
-    private Camera camera;
     private Rect framingRect;
     private Rect framingRectInPreview;
     private boolean initialized;
-    private boolean previewing;
-    private final boolean useOneShotPreviewCallback;
+
+    private int mCameraId = CameraCharacteristics.LENS_FACING_FRONT;//当前Camera的ID，后摄像头
+    private CameraDevice mCameraDevice;//标识打开的CameraDevice
+    private CaptureRequest.Builder mPreviewRequestBuilder;//相机预览请求的构造器
+    private CameraCaptureSession mCaptureSession;
+    private CaptureRequest mPreviewRequest;//预览请求
+    private android.hardware.camera2.CameraManager mCameraManager;//相机管理者
+    public CameraCharacteristics mCameraCharacteristics;//相机属性
+    private HandlerThread mBackgroundThread;
+    private Handler mBackgroundHandler;
+    private ImageReader mImageReader;//预览回调的接收者，可以间接地获取预览帧数据，类似Camera的AutoFocusCallback:
+    private boolean mFlashSupported;//当前摄像头是否支持闪关灯
+    private AutoFitSurfaceView mSurfaceView;
     /**
-     * Preview frames are delivered here, which we pass on to the registered handler. Make sure to
-     * clear the handler so it will only receive one message.
+     * A {@link Semaphore} to prevent the app from exiting before closing the camera.
+     * 用来防止程序在关闭摄像头之前退出
      */
-    private final PreviewCallback previewCallback;
-    /**
-     * Autofocus callbacks arrive here, and are dispatched to the Handler which requested them.
-     */
-    private final AutoFocusCallback autoFocusCallback;
+    private Semaphore mCameraOpenCloseLock = new Semaphore(1);
 
     /**
      * Initializes this static object with the Context of the calling Activity.
@@ -94,118 +118,268 @@ public final class CameraManager {
     }
 
     private CameraManager(Context context) {
-
         this.context = context;
         this.configManager = new CameraConfigurationManager(context);
+        mCameraManager = (android.hardware.camera2.CameraManager)context.getSystemService(Context.CAMERA_SERVICE);
+        try {
+            mCameraCharacteristics = mCameraManager.getCameraCharacteristics(Integer.toString(mCameraId));
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
 
-        // Camera.setOneShotPreviewCallback() has a race condition in Cupcake, so we use the older
-        // Camera.setPreviewCallback() on 1.5 and earlier. For Donut and later, we need to use
-        // the more efficient one shot callback, as the older one can swamp the system and cause it
-        // to run out of memory. We can't use SDK_INT because it was introduced in the Donut SDK.
-        //useOneShotPreviewCallback = Integer.parseInt(Build.VERSION.SDK) > Build.VERSION_CODES.CUPCAKE;
-        useOneShotPreviewCallback = Integer.parseInt(Build.VERSION.SDK) > 3; // 3 = Cupcake
-
-        previewCallback = new PreviewCallback(configManager, useOneShotPreviewCallback);
-        autoFocusCallback = new AutoFocusCallback();
+    /**
+     * 设置相机相关的变量
+     */
+    private void setUpCameraOutputs(){
+        if(!initialized){
+            initialized = true;
+            configManager.initFromCameraParameters(mCameraCharacteristics);
+        }
+        Point cameraResolution = configManager.getCameraResolution();
+        mImageReader = ImageReader.newInstance(cameraResolution.x,cameraResolution.y,
+                configManager.getPreviewFormat(),1);//ImageFormat.YUV_420_888
+        mImageReader.setOnImageAvailableListener(
+                mOnImageAvailableListener, mBackgroundHandler);
+        //检查是否支持闪光灯
+        Boolean available = mCameraCharacteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
+        mFlashSupported = available == null ? false : available;
     }
 
     /**
      * Opens the camera driver and initializes the hardware parameters.
      *
-     * @param holder The surface object which the camera will draw preview frames into.
-     * @throws IOException Indicates the camera driver failed to open.
      */
-    public void openDriver(SurfaceHolder holder) throws IOException {
-        if (camera == null) {
-            camera = Camera.open();
-            if (camera == null) {
-                throw new IOException();
+    @SuppressLint("MissingPermission")
+    public void openDriver(AutoFitSurfaceView surfaceView) {
+        startBackgroundThread();
+        mSurfaceView = surfaceView;
+        setUpCameraOutputs();
+        try {
+            if (!mCameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+                throw new RuntimeException("Time out waiting to lock camera opening.");
             }
-            camera.setPreviewDisplay(holder);
-
-            if (!initialized) {
-                initialized = true;
-                configManager.initFromCameraParameters(camera);
-            }
-            configManager.setDesiredCameraParameters(camera);
-
-            //FIXME
-            //     SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
-            //�Ƿ�ʹ��ǰ��
-//      if (prefs.getBoolean(PreferencesActivity.KEY_FRONT_LIGHT, false)) {
-//        FlashlightManager.enableFlashlight();
-//      }
-            FlashlightManager.enableFlashlight();
+            mCameraManager.openCamera(Integer.toString(mCameraId),mStateCallback,mBackgroundHandler);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        } catch (InterruptedException e) {
+            throw new RuntimeException("Interrupted while trying to lock camera opening.", e);
         }
     }
 
     /**
-     * Closes the camera driver if still in use.
+     *Camera状态回调
+     */
+    private final CameraDevice.StateCallback mStateCallback = new CameraDevice.StateCallback() {
+        @Override
+        public void onOpened(@NonNull CameraDevice cameraDevice) {
+            mCameraOpenCloseLock.release();
+            //初始化cameraDevice
+            mCameraDevice = cameraDevice;
+            //创建预览会话
+            createCameraPreviewSession();
+        }
+
+        @Override
+        public void onDisconnected(@NonNull CameraDevice cameraDevice) {
+            mCameraOpenCloseLock.release();
+            cameraDevice.close();
+            mCameraDevice = null;
+        }
+
+        @Override
+        public void onError(@NonNull CameraDevice cameraDevice, int i) {
+            mCameraOpenCloseLock.release();
+            cameraDevice.close();
+            mCameraDevice = null;
+        }
+    };
+
+    /**
+     * 开启相机预览
+     */
+    private void createCameraPreviewSession() {
+        try {
+            //创建一个预览的请求
+            mPreviewRequestBuilder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            //设置预览输出的Surface
+            mPreviewRequestBuilder.addTarget(mSurfaceView.getHolder().getSurface());
+            //设置预览回调的Surface,在mOnImageAvailableListener中对帧数据进行处理
+            mPreviewRequestBuilder.addTarget(mImageReader.getSurface());
+            //outputs： 输出的Surface集合，每个CaptureRequest的输出Surface都应该是outputs的一个子元素。
+            //stateCallback：创建会话的回调
+            //handler：指定回调执行的线程，传 null 时默认使用当前线程的 Looper。
+            mCameraDevice.createCaptureSession(Arrays.asList(mSurfaceView.getHolder().getSurface(),mImageReader.getSurface()),
+                    new CameraCaptureSession.StateCallback() {
+                        @Override
+                        public void onConfigured(@NonNull CameraCaptureSession cameraCaptureSession) {
+                            if (null == mCameraDevice) {
+                                return;
+                            }
+                            //获取CameraCaptureSession 实例
+                            mCaptureSession = cameraCaptureSession;
+                            try {
+
+                                // 设置连续自动对焦
+                                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                                if (mFlashSupported) {
+                                    mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                                            CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+                                }
+                                mPreviewRequest = mPreviewRequestBuilder.build();
+                                //通过调用 setRepeatingRequest方法，请求不断重复捕获图像，即实现预览
+                                mCaptureSession.setRepeatingRequest(mPreviewRequest,
+                                        null, mBackgroundHandler);
+                            } catch (CameraAccessException e) {
+                                e.printStackTrace();
+                            }
+                        }
+
+                        @Override
+                        public void onConfigureFailed(
+                                @NonNull CameraCaptureSession cameraCaptureSession) {
+                            Log.i(TAG, "onConfigureFailed: Failed");
+                        }
+                    }, null
+            );
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * 当有图像流数据可用时会回调onImageAvailable方法，它的参数就是预览帧数据，可以对这帧数据进行处理
+     * 类似于Camera1中的PreviewCallback接口
+     */
+    private final ImageReader.OnImageAvailableListener mOnImageAvailableListener = new ImageReader.OnImageAvailableListener() {
+        @Override
+        public void onImageAvailable(ImageReader imageReader) {
+            //接收预览的帧数据
+            Image image = imageReader.acquireNextImage();
+            if(image == null){
+                return;
+            }
+            int width = image.getWidth();
+            int height = image.getHeight();
+            Image.Plane[] planes = image.getPlanes();
+            ByteBuffer buffer;
+            byte[] bytes = null;
+            if (image.getFormat()==ImageFormat.YUV_420_888) {
+                buffer = planes[0].getBuffer();
+                if (bytes == null) {
+                    bytes = new byte[buffer.capacity() * 3 / 2];
+                }
+                int len = buffer.capacity();
+                buffer.get(bytes, 0, len);
+                buffer = planes[2].getBuffer();//plane[0] + plane[2] =NV21;; plane[0] + plane[1] =NV12
+                buffer.get(bytes, len, buffer.capacity());
+            }
+            image.close();
+            if(previewHandler != null){
+                if(bytes != null){
+                    Message message = previewHandler.obtainMessage(previewMessage, width,
+                            height, bytes);
+                    message.sendToTarget();
+                    previewHandler = null;
+                }
+            }else {
+                Log.d(TAG, "Got preview callback, but no handler for it");
+            }
+        }
+    };
+
+    /**
+     * 关闭相机
      */
     public void closeDriver() {
-        if (camera != null) {
-            FlashlightManager.disableFlashlight();
-            camera.release();
-            camera = null;
-        }
-    }
-
-    /**
-     * Asks the camera hardware to begin drawing preview frames to the screen.
-     */
-    public void startPreview() {
-        if (camera != null && !previewing) {
-            camera.startPreview();
-            previewing = true;
-        }
-    }
-
-    /**
-     * Tells the camera to stop drawing preview frames.
-     */
-    public void stopPreview() {
-        if (camera != null && previewing) {
-            if (!useOneShotPreviewCallback) {
-                camera.setPreviewCallback(null);
+        try {
+            mCameraOpenCloseLock.acquire();
+            if (null != mCaptureSession) {
+                mCaptureSession.close();
+                mCaptureSession = null;
             }
-            camera.stopPreview();
-            previewCallback.setHandler(null, 0);
-            autoFocusCallback.setHandler(null, 0);
-            previewing = false;
+            if (null != mCameraDevice) {
+                mCameraDevice.close();
+                mCameraDevice = null;
+            }
+            if (null != mImageReader) {
+                mImageReader.close();
+                mImageReader = null;
+            }
+            stopBackgroundThread();
+        } catch (InterruptedException e) {
+            throw new RuntimeException("Interrupted while trying to lock camera closing.", e);
+        } finally {
+            mCameraOpenCloseLock.release();
         }
     }
 
     /**
-     * A single preview frame will be returned to the handler supplied. The data will arrive as byte[]
-     * in the message.obj field, with width and height encoded as message.arg1 and message.arg2,
-     * respectively.
+     * 开启闪光灯
+     */
+    public void openFlash(){
+        if(mFlashSupported){
+            mPreviewRequestBuilder.set(CaptureRequest.FLASH_MODE,CaptureRequest.FLASH_MODE_TORCH);
+            mPreviewRequest = mPreviewRequestBuilder.build();
+            try {
+                mCaptureSession.setRepeatingRequest(mPreviewRequest,
+                        null, mBackgroundHandler);
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    /**
+     * 关闭闪光灯
+     */
+    public void closeFlash(){
+        if(mFlashSupported){
+            mPreviewRequestBuilder.set(CaptureRequest.FLASH_MODE,CaptureRequest.FLASH_MODE_OFF);
+            mPreviewRequest = mPreviewRequestBuilder.build();
+            try {
+                mCaptureSession.setRepeatingRequest(mPreviewRequest,
+                        null, mBackgroundHandler);
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    /**
+     * Starts a background thread and its {@link Handler}.
+     */
+    private void startBackgroundThread() {
+        mBackgroundThread = new HandlerThread("CameraBackground");
+        mBackgroundThread.start();
+        mBackgroundHandler = new Handler(mBackgroundThread.getLooper());
+    }
+
+    /**
+     * Stops the background thread and its {@link Handler}.
+     */
+    private void stopBackgroundThread() {
+        mBackgroundThread.quitSafely();
+        try {
+            mBackgroundThread.join();
+            mBackgroundThread = null;
+            mBackgroundHandler = null;
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private Handler previewHandler;
+    private int previewMessage;
+    /**
+     * 解码请求
      *
      * @param handler The handler to send the message to.
      * @param message The what field of the message to be sent.
      */
-    public void requestPreviewFrame(Handler handler, int message) {
-        if (camera != null && previewing) {
-            previewCallback.setHandler(handler, message);
-            if (useOneShotPreviewCallback) {
-                camera.setOneShotPreviewCallback(previewCallback);
-            } else {
-                camera.setPreviewCallback(previewCallback);
-            }
-        }
-    }
-
-    /**
-     * Asks the camera hardware to perform an autofocus.
-     *
-     * @param handler The Handler to notify when the autofocus completes.
-     * @param message The message to deliver.
-     */
-    public void requestAutoFocus(Handler handler, int message) {
-        if (camera != null && previewing) {
-            autoFocusCallback.setHandler(handler, message);
-            //Log.d(TAG, "Requesting auto-focus callback");
-            camera.autoFocus(autoFocusCallback);
-        }
+    public void requestDecode(Handler handler, int message) {
+        this.previewHandler = handler;
+        this.previewMessage = message;
     }
 
     /**
@@ -218,10 +392,6 @@ public final class CameraManager {
     public Rect getFramingRect() {
         try {
             Point screenResolution = configManager.getScreenResolution();
-            // if (framingRect == null) {
-            if (camera == null) {
-                return null;
-            }
 
             int leftOffset = (screenResolution.x - FRAME_WIDTH) / 2;
 
@@ -232,7 +402,6 @@ public final class CameraManager {
                 topOffset = (screenResolution.y - FRAME_HEIGHT) / 2;
             }
             framingRect = new Rect(leftOffset, topOffset, leftOffset + FRAME_WIDTH, topOffset + FRAME_HEIGHT);
-            // }
             return framingRect;
         } catch (Exception e) {
             e.printStackTrace();
@@ -264,27 +433,6 @@ public final class CameraManager {
     }
 
     /**
-     * Converts the result points from still resolution coordinates to screen coordinates.
-     *
-     * @param points The points returned by the Reader subclass through Result.getResultPoints().
-     * @return An array of Points scaled to the size of the framing rect and offset appropriately
-     *         so they can be drawn in screen coordinates.
-     */
-  /*
-  public Point[] convertResultPoints(ResultPoint[] points) {
-    Rect frame = getFramingRectInPreview();
-    int count = points.length;
-    Point[] output = new Point[count];
-    for (int x = 0; x < count; x++) {
-      output[x] = new Point();
-      output[x].x = frame.left + (int) (points[x].getX() + 0.5f);
-      output[x].y = frame.top + (int) (points[x].getY() + 0.5f);
-    }
-    return output;
-  }
-   */
-
-    /**
      * A factory method to build the appropriate LuminanceSource object based on the format
      * of the preview buffers, as described by Camera.Parameters.
      *
@@ -296,7 +444,6 @@ public final class CameraManager {
     public PlanarYUVLuminanceSource buildLuminanceSource(byte[] data, int width, int height) {
         Rect rect = getFramingRectInPreview();
         int previewFormat = configManager.getPreviewFormat();
-        String previewFormatString = configManager.getPreviewFormatString();
         switch (previewFormat) {
             // This is the standard Android format which all devices are REQUIRED to support.
             // In theory, it's the only one we should ever care about.
@@ -304,45 +451,16 @@ public final class CameraManager {
                 // This format has never been seen in the wild, but is compatible as we only care
                 // about the Y channel, so allow it.
             case PixelFormat.YCbCr_422_SP:
-                return new PlanarYUVLuminanceSource(data, width, height, rect.left, rect.top,
-                        rect.width(), rect.height());
+            case ImageFormat.YUV_420_888:
             default:
                 // The Samsung Moment incorrectly uses this variant instead of the 'sp' version.
                 // Fortunately, it too has all the Y data up front, so we can read it.
-                if ("yuv420p".equals(previewFormatString)) {
                     return new PlanarYUVLuminanceSource(data, width, height, rect.left, rect.top,
                             rect.width(), rect.height());
-                }
         }
-        throw new IllegalArgumentException("Unsupported picture format: " +
-                previewFormat + '/' + previewFormatString);
     }
 
     public Context getContext() {
         return context;
-    }
-
-    public Camera getCamera() {
-        return camera;
-    }
-
-    public boolean isPreviewing() {
-        return previewing;
-    }
-
-    public boolean isUseOneShotPreviewCallback() {
-        return useOneShotPreviewCallback;
-    }
-
-    public PreviewCallback getPreviewCallback() {
-        return previewCallback;
-    }
-
-    public AutoFocusCallback getAutoFocusCallback() {
-        return autoFocusCallback;
-    }
-
-    public void setPreviewing(boolean previewing) {
-        this.previewing = previewing;
     }
 }

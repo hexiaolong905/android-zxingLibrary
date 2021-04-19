@@ -2,9 +2,7 @@ package com.uuzuche.lib_zxing.activity;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.graphics.Canvas;
 import android.graphics.Matrix;
-import android.hardware.Camera;
 import android.os.Bundle;
 import android.text.TextUtils;
 
@@ -24,7 +22,6 @@ import com.uuzuche.lib_zxing.camera.CameraManager;
 import com.uuzuche.lib_zxing.decoding.DecodeFormatManager;
 
 import java.util.Hashtable;
-import java.util.Objects;
 import java.util.Vector;
 
 /**
@@ -204,19 +201,9 @@ public class CodeUtils {
 
     public static void isLightEnable(boolean isEnable) {
         if (isEnable) {
-            Camera camera = CameraManager.get().getCamera();
-            if (camera != null) {
-                Camera.Parameters parameter = camera.getParameters();
-                parameter.setFlashMode(Camera.Parameters.FLASH_MODE_TORCH);
-                camera.setParameters(parameter);
-            }
+            CameraManager.get().openFlash();
         } else {
-            Camera camera = CameraManager.get().getCamera();
-            if (camera != null) {
-                Camera.Parameters parameter = camera.getParameters();
-                parameter.setFlashMode(Camera.Parameters.FLASH_MODE_OFF);
-                camera.setParameters(parameter);
-            }
+            CameraManager.get().closeFlash();
         }
     }
 }

@@ -3,12 +3,12 @@ package com.uuch.android_zxinglibrary;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.os.Bundle;
-import android.support.v7.app.AppCompatActivity;
+import android.util.Log;
 import android.view.View;
 import android.widget.LinearLayout;
 
-import com.uuzuche.lib_zxing.activity.CaptureFragment;
 import com.uuzuche.lib_zxing.activity.CodeUtils;
+import com.uuzuche.lib_zxing.activity.CaptureFragment;
 
 /**
  * 定制化显示扫描界面
@@ -26,8 +26,17 @@ public class SecondActivity extends BaseActivity {
         CodeUtils.setFragmentArgs(captureFragment, R.layout.my_camera);
         captureFragment.setAnalyzeCallback(analyzeCallback);
         getSupportFragmentManager().beginTransaction().replace(R.id.fl_my_container, captureFragment).commit();
-
         initView();
+        captureFragment.setCameraInitCallBack(new CaptureFragment.CameraInitCallBack() {
+            @Override
+            public void callBack(Exception e) {
+                if (e == null) {
+
+                } else {
+                    Log.e("TAG", "callBack: ", e);
+                }
+            }
+        });
     }
 
     public static boolean isOpen = false;

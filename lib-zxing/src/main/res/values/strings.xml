@@ -3,4 +3,6 @@
 
     <!-- TODO: Remove or change this placeholder text -->
     <string name="hello_blank_fragment">Hello blank fragment</string>
+    <string name="request_permission">Need Camera Permission</string>
+    <string name="camera_error">This device doesn\'t support Camera2 API.</string>
 </resources>
